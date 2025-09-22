@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual envs
+.venv/
+venv/
+env/
+ENV/
+
+# Logs / outputs
+logs/
+*.log
+orders.csv
+events.csv
+
+# Local env files
+.env
+*.env
+.env.*
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+

@@ -1,16 +1,22 @@
 FROM python:3.11-slim
 
-# System deps (faster numpy/pandas wheels; add build tools only if needed)
+# System deps for SSL + basic tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
+
+# Install Python deps first (layer caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy code
-COPY bot.py /app/bot.py
+# Copy all source (respects .dockerignore)
+COPY . .
 
-# Railway sets $PORT; your app already honors it in start_health_server()
+# Railway exposes $PORT; your app binds to it already
 ENV PYTHONUNBUFFERED=1
+
+# IMPORTANT: run the correct filename here
+# If your main file is "hyperliquidNativeSwitcher.py", keep it:
 CMD ["python", "-u", "hyperliquidNativeSwitcher.py"]
+
