@@ -80,7 +80,7 @@ IMPACT_BPS_CAP     = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp price 
 MAX_SLICE_USD      = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
 SLICE_TIME_BUDGET  = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
 
-GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(6 * 60 * 60)))  # default 6 hours
+GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(1 * 30 * 60)))  # default 6 hours
 
 TWAP_STATE_FILE = "twap_state.json"
 
