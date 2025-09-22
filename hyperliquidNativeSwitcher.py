@@ -267,6 +267,9 @@ def send_message(message: str):
     if TELEGRAM_SPAM_GUARD and (time.time() - _last_sent < 10):
         return
     _last_sent = time.time()
+
+    wallet_tag = f"[{HL_WALLET_ADDRESS[:6]}…{HL_WALLET_ADDRESS[-4:]}]"
+    msg = f"{wallet_tag} {message}"
     try:
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
