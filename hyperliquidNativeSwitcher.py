@@ -71,11 +71,15 @@ MAX_SLIPPAGE_BPS     = int(os.getenv('MAX_SLIPPAGE_BPS', '10'))   # 0.10%
 ORDERBOOK_LIMIT      = int(os.getenv('ORDERBOOK_LIMIT', '50'))
 MIN_QUOTE_TO_TRADE   = float(os.getenv('MIN_QUOTE_TO_TRADE', '12.0'))
 TARGET_TOL_PCT       = float(os.getenv('TARGET_TOL_PCT', '0.99'))
-MAX_SLICES           = int(os.getenv('MAX_SLICES', '5'))
+MAX_SLICES           = int(os.getenv('MAX_SLICES', '999'))
 SLICE_DELAY_SEC      = float(os.getenv('SLICE_DELAY_SEC', '0'))   # micro-TWAP pacing
 MAX_REBALANCE_STEPS  = int(os.getenv('MAX_REBALANCE_STEPS', '6'))
 SLEEP_SEC            = int(os.getenv('SLEEP_SEC', str(1 * 15 * 60)))
 TELEGRAM_SPAM_GUARD  = int(os.getenv('TELEGRAM_SPAM_GUARD', '1'))
+IMPACT_BPS_CAP     = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp price impact per slice
+MAX_SLICE_USD      = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
+SLICE_TIME_BUDGET  = float(os.getenv('SLICE_TIME_BUDGET', '20'))  # seconds max per leg
+
 
 assert HL_WALLET_ADDRESS and HL_PRIVATE_KEY, "Set HL_WALLET_ADDRESS and HL_PRIVATE_KEY."
 
@@ -432,127 +436,110 @@ def place_ioc_limit(symbol, side, base_amount, limit_price):
     }
     return order, cloid
 
-
-
-
-
-def market_sell_all(symbol: str, max_slippage_bps: int):
-    """
-    Sell BASE->USDC with bounded slippage. Slices (micro-TWAP).
-    Returns a dict summary of slices and totals for reporting.
-    """
+def market_sell_all(symbol: str, _ignored_max_slippage_bps: int):
     fee = taker_fee(symbol)
-    base_asset = symbol.split('/')[0]  # 'UETH' or 'UBTC'
+    base_asset = symbol.split('/')[0]
     slices = []
     total_base_filled = 0.0
     total_usdc_proceeds = 0.0
+    t0 = time.time()
 
-    for s in range(MAX_SLICES):
-        # balances BEFORE slice
+    while True:
+        if time.time() - t0 > SLICE_TIME_BUDGET: break
         usdc_b, ueth_b, ubtc_b = get_spot_balances()
         have_b = ueth_b if base_asset == 'UETH' else ubtc_b
-        if have_b <= 0:
-            break
+        if have_b <= 0: break
 
-        plan = plan_sell(symbol, have_b, max_slippage_bps, fee)
-        if not plan:
-            break
-        notional_plan = plan["est_avg_px"] * plan["est_base"]
-        if notional_plan < MIN_QUOTE_TO_TRADE:
-            break
+        plan = plan_sell(symbol, have_b, IMPACT_BPS_CAP, fee)
+        if not plan: break
 
-        order, cloid = place_ioc_limit(symbol, 'sell', plan["est_base"], plan["min_px"])
+        # cap per-slice notional (convert to base at est_avg_px)
+        est_quote = plan["est_avg_px"] * plan["est_base"]
+        if est_quote > MAX_SLICE_USD:
+            est_base = max(0.0, MAX_SLICE_USD / plan["est_avg_px"])
+            if est_base * plan["est_avg_px"] < MIN_QUOTE_TO_TRADE: break
+            order, cloid = place_ioc_limit(symbol, 'sell', est_base, plan["min_px"])
+        else:
+            order, cloid = place_ioc_limit(symbol, 'sell', plan["est_base"], plan["min_px"])
 
-        # balances AFTER slice
+        # measure realized fill
         usdc_a, ueth_a, ubtc_a = get_spot_balances()
         have_a = ueth_a if base_asset == 'UETH' else ubtc_a
-
         base_filled = max(0.0, have_b - have_a)
-        usdc_delta = max(0.0, usdc_a - usdc_b)
-        avg_px_realized = (usdc_delta / base_filled) if base_filled > 0 else plan["est_avg_px"]
+        usdc_proceeds = max(0.0, usdc_a - usdc_b)
+        if base_filled <= 1e-12: break
+
+        avg_px_realized = usdc_proceeds / base_filled
+        total_base_filled += base_filled
+        total_usdc_proceeds += usdc_proceeds
 
         slices.append({
-            "side": "SELL",
-            "symbol": symbol,
-            "req_base": plan["est_base"],
-            "limit_px": plan["min_px"],
-            "base_filled": base_filled,
-            "usdc_proceeds": usdc_delta,
-            "avg_px_realized": avg_px_realized,
-            "resp": order,
+            "side":"SELL","symbol":symbol,
+            "base_filled":base_filled,"usdc_proceeds":usdc_proceeds,
+            "avg_px_realized":avg_px_realized,"resp":order
         })
 
-        total_base_filled += base_filled
-        total_usdc_proceeds += usdc_delta
-
-        if base_filled <= 1e-12:
-            break
-        if SLICE_DELAY_SEC > 0:
-            time.sleep(SLICE_DELAY_SEC)
+        if SLICE_DELAY_SEC > 0: time.sleep(SLICE_DELAY_SEC)
 
     return {
-        "action": "SELL",
-        "symbol": symbol,
-        "slices": slices,
-        "total_base": total_base_filled,
-        "total_usdc": total_usdc_proceeds,
+        "action":"SELL","symbol":symbol,"slices":slices,
+        "total_base":total_base_filled,"total_usdc":total_usdc_proceeds
     }
 
 
-def market_buy_with_usdc(symbol: str, usdc_to_spend: float, max_slippage_bps: int):
-    """
-    Buy BASE with USDC within slippage bound. Slices (micro-TWAP).
-    Returns a dict summary of slices and totals for reporting.
-    """
+
+def market_buy_with_usdc(symbol: str, usdc_to_spend: float, _ignored_max_slippage_bps: int):
     fee = taker_fee(symbol)
     slices = []
     total_base_bought = 0.0
     total_usdc_spent = 0.0
+    t0 = time.time()
 
-    for s in range(MAX_SLICES):
-        # balances BEFORE slice
+    while True:
+        if time.time() - t0 > SLICE_TIME_BUDGET: break
         usdc_b, ueth_b, ubtc_b = get_spot_balances()
-        remaining = min(usdc_b, usdc_to_spend) if s == 0 else usdc_b
-        if remaining < MIN_QUOTE_TO_TRADE:
-            break
+        budget = min(usdc_b, usdc_to_spend - total_usdc_spent)
+        if budget < MIN_QUOTE_TO_TRADE: break
 
-        plan = plan_buy(symbol, remaining, max_slippage_bps, fee)
-        if not plan:
-            break
-        if plan["est_quote"] < MIN_QUOTE_TO_TRADE:
-            break
+        # plan at IMPACT_BPS_CAP
+        plan = plan_buy(symbol, budget, IMPACT_BPS_CAP, fee)
+        if not plan: break
 
-        order, cloid = place_ioc_limit(symbol, 'buy', plan["est_base"], plan["max_px"])
+        # cap per-slice notional
+        if plan["est_quote"] > MAX_SLICE_USD:
+            scale = MAX_SLICE_USD / plan["est_quote"]
+            est_base = max(0.0, plan["est_base"] * scale)
+            if est_base * plan["est_avg_px"] < MIN_QUOTE_TO_TRADE: break
+            order, cloid = place_ioc_limit(symbol, 'buy', est_base, plan["max_px"])
+        else:
+            order, cloid = place_ioc_limit(symbol, 'buy', plan["est_base"], plan["max_px"])
 
-        # balances AFTER slice
+        # measure realized fill
         usdc_a, ueth_a, ubtc_a = get_spot_balances()
-        # detect which base we bought
-        base_asset = symbol.split('/')[0]  # 'UETH' or 'UBTC'
+        base_asset = symbol.split('/')[0]
         base_b = ueth_b if base_asset == 'UETH' else ubtc_b
         base_a = ueth_a if base_asset == 'UETH' else ubtc_a
-
         base_filled = max(0.0, base_a - base_b)
-        usdc_delta = max(0.0, usdc_b - usdc_a)  # spent
-        avg_px_realized = (usdc_delta / base_filled) if base_filled > 0 else plan["est_avg_px"]
+        usdc_spent  = max(0.0, usdc_b - usdc_a)
+        if base_filled <= 1e-12: break
+
+        avg_px_realized = usdc_spent / base_filled
+        total_base_bought += base_filled
+        total_usdc_spent  += usdc_spent
 
         slices.append({
-            "side": "BUY",
-            "symbol": symbol,
-            "req_base": plan["est_base"],
-            "limit_px": plan["max_px"],
-            "base_filled": base_filled,
-            "usdc_spent": usdc_delta,
-            "avg_px_realized": avg_px_realized,
-            "resp": order,
+            "side":"BUY","symbol":symbol,
+            "base_filled":base_filled,"usdc_spent":usdc_spent,
+            "avg_px_realized":avg_px_realized,"resp":order
         })
 
-        total_base_bought += base_filled
-        total_usdc_spent += usdc_delta
+        if SLICE_DELAY_SEC > 0: time.sleep(SLICE_DELAY_SEC)
 
-        if base_filled <= 1e-12:
-            break
-        if SLICE_DELAY_SEC > 0:
-            time.sleep(SLICE_DELAY_SEC)
+    return {
+        "action":"BUY","symbol":symbol,"slices":slices,
+        "total_base":total_base_bought,"total_usdc":total_usdc_spent
+    }
+
 
     return {
         "action": "BUY",
