@@ -72,13 +72,17 @@ ORDERBOOK_LIMIT      = int(os.getenv('ORDERBOOK_LIMIT', '50'))
 MIN_QUOTE_TO_TRADE   = float(os.getenv('MIN_QUOTE_TO_TRADE', '12.0'))
 TARGET_TOL_PCT       = float(os.getenv('TARGET_TOL_PCT', '0.99'))
 MAX_SLICES           = int(os.getenv('MAX_SLICES', '999'))
-SLICE_DELAY_SEC      = float(os.getenv('SLICE_DELAY_SEC', '0'))   # micro-TWAP pacing
-MAX_REBALANCE_STEPS  = int(os.getenv('MAX_REBALANCE_STEPS', '6'))
+SLICE_DELAY_SEC      = float(os.getenv('SLICE_DELAY_SEC', '0.5'))   # micro-TWAP pacing
+MAX_REBALANCE_STEPS  = int(os.getenv('MAX_REBALANCE_STEPS', '99'))
 SLEEP_SEC            = int(os.getenv('SLEEP_SEC', str(1 * 15 * 60)))
 TELEGRAM_SPAM_GUARD  = int(os.getenv('TELEGRAM_SPAM_GUARD', '1'))
 IMPACT_BPS_CAP     = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp price impact per slice
 MAX_SLICE_USD      = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
-SLICE_TIME_BUDGET  = float(os.getenv('SLICE_TIME_BUDGET', '20'))  # seconds max per leg
+SLICE_TIME_BUDGET  = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
+
+GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(6 * 60 * 60)))  # default 6 hours
+
+TWAP_STATE_FILE = "twap_state.json"
 
 
 assert HL_WALLET_ADDRESS and HL_PRIVATE_KEY, "Set HL_WALLET_ADDRESS and HL_PRIVATE_KEY."
@@ -145,6 +149,28 @@ try:
     _ = exchange.fetch_balance({'type': 'spot'})
 except Exception as e:
     raise SystemExit(f"[PRECHECK] Spot balance failed for API wallet {API_WALLET_ADDRESS}: {e}")
+
+def load_twap_state():
+    try:
+        with open(TWAP_STATE_FILE, "r") as f:
+            st = json.load(f)
+            # normalize
+            st["end_ts"] = float(st.get("end_ts", 0.0))
+            st["target"] = st.get("target")
+            st["active"] = bool(st.get("active", False))
+            return st
+    except Exception:
+        return {"active": False, "target": None, "end_ts": 0.0}
+
+def save_twap_state(state: dict):
+    try:
+        with open(TWAP_STATE_FILE, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def clear_twap_state():
+    save_twap_state({"active": False, "target": None, "end_ts": 0.0})
 
 def _fmt_usd(x: float) -> str:
     return f"${x:,.2f}"
@@ -436,7 +462,7 @@ def place_ioc_limit(symbol, side, base_amount, limit_price):
     }
     return order, cloid
 
-def market_sell_all(symbol: str, _ignored_max_slippage_bps: int):
+def market_sell_all(symbol: str, time_budget_sec: float):
     fee = taker_fee(symbol)
     base_asset = symbol.split('/')[0]
     slices = []
@@ -445,7 +471,7 @@ def market_sell_all(symbol: str, _ignored_max_slippage_bps: int):
     t0 = time.time()
 
     while True:
-        if time.time() - t0 > SLICE_TIME_BUDGET: break
+        if time.time() - t0 > time_budget_sec: break
         usdc_b, ueth_b, ubtc_b = get_spot_balances()
         have_b = ueth_b if base_asset == 'UETH' else ubtc_b
         if have_b <= 0: break
@@ -453,7 +479,6 @@ def market_sell_all(symbol: str, _ignored_max_slippage_bps: int):
         plan = plan_sell(symbol, have_b, IMPACT_BPS_CAP, fee)
         if not plan: break
 
-        # cap per-slice notional (convert to base at est_avg_px)
         est_quote = plan["est_avg_px"] * plan["est_base"]
         if est_quote > MAX_SLICE_USD:
             est_base = max(0.0, MAX_SLICE_USD / plan["est_avg_px"])
@@ -462,7 +487,6 @@ def market_sell_all(symbol: str, _ignored_max_slippage_bps: int):
         else:
             order, cloid = place_ioc_limit(symbol, 'sell', plan["est_base"], plan["min_px"])
 
-        # measure realized fill
         usdc_a, ueth_a, ubtc_a = get_spot_balances()
         have_a = ueth_a if base_asset == 'UETH' else ubtc_a
         base_filled = max(0.0, have_b - have_a)
@@ -487,8 +511,7 @@ def market_sell_all(symbol: str, _ignored_max_slippage_bps: int):
     }
 
 
-
-def market_buy_with_usdc(symbol: str, usdc_to_spend: float, _ignored_max_slippage_bps: int):
+def market_buy_with_usdc(symbol: str, usdc_to_spend: float, time_budget_sec: float):
     fee = taker_fee(symbol)
     slices = []
     total_base_bought = 0.0
@@ -496,16 +519,14 @@ def market_buy_with_usdc(symbol: str, usdc_to_spend: float, _ignored_max_slippag
     t0 = time.time()
 
     while True:
-        if time.time() - t0 > SLICE_TIME_BUDGET: break
+        if time.time() - t0 > time_budget_sec: break
         usdc_b, ueth_b, ubtc_b = get_spot_balances()
         budget = min(usdc_b, usdc_to_spend - total_usdc_spent)
         if budget < MIN_QUOTE_TO_TRADE: break
 
-        # plan at IMPACT_BPS_CAP
         plan = plan_buy(symbol, budget, IMPACT_BPS_CAP, fee)
         if not plan: break
 
-        # cap per-slice notional
         if plan["est_quote"] > MAX_SLICE_USD:
             scale = MAX_SLICE_USD / plan["est_quote"]
             est_base = max(0.0, plan["est_base"] * scale)
@@ -514,7 +535,6 @@ def market_buy_with_usdc(symbol: str, usdc_to_spend: float, _ignored_max_slippag
         else:
             order, cloid = place_ioc_limit(symbol, 'buy', plan["est_base"], plan["max_px"])
 
-        # measure realized fill
         usdc_a, ueth_a, ubtc_a = get_spot_balances()
         base_asset = symbol.split('/')[0]
         base_b = ueth_b if base_asset == 'UETH' else ubtc_b
@@ -541,14 +561,6 @@ def market_buy_with_usdc(symbol: str, usdc_to_spend: float, _ignored_max_slippag
     }
 
 
-    return {
-        "action": "BUY",
-        "symbol": symbol,
-        "slices": slices,
-        "total_base": total_base_bought,
-        "total_usdc": total_usdc_spent,
-    }
-
 
 # ---------------------- State / rebalancing ----------------------
 def get_state_and_percents():
@@ -563,68 +575,66 @@ def get_state_and_percents():
     else: state = 'MIXED'
     return state, {'ETH': pct_eth, 'BTC': pct_btc, 'USDC': pct_usd}, total, a
 
-def rebalance_to_target(target: str) -> tuple[bool, str]:
+def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool, str, bool]:
     """
-    Rebalance to target and return (changed, execution_message).
-    Message includes per-leg totals and the new position split.
+    Rebalance toward target for up to time_budget_sec seconds.
+    Returns (changed_any, message, reached_target_bool).
     """
     changed = False
     leg_reports = []
+    t0 = time.time()
 
-    for _ in range(MAX_REBALANCE_STEPS):
+    while True:
+        if time.time() - t0 > time_budget_sec:
+            break
+
         state, pct, total, a = get_state_and_percents()
-        if target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT: break
-        if target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT: break
-        if target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT: break
+        # stop if target reached
+        if target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True)
+        if target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True)
+        if target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True)
 
         before = a.copy()
 
+        # allocate a small sub-budget per inner leg (e.g., 5–10s) so we cycle both legs if needed
+        per_leg = max(1.0, min(10.0, time_budget_sec - (time.time() - t0)))
+
         if target == 'ETH':
-            if a['UBTC'] > 0.0:
-                rep = market_sell_all(BTC_SYM, MAX_SLIPPAGE_BPS)
-                leg_reports.append(rep)
+            if a['UBTC'] > 0.0: leg_reports.append(market_sell_all(BTC_SYM, per_leg))
             usdc, _, _ = get_spot_balances()
-            if usdc > MIN_QUOTE_TO_TRADE:
-                rep = market_buy_with_usdc(ETH_SYM, usdc, MAX_SLIPPAGE_BPS)
-                leg_reports.append(rep)
+            if usdc > MIN_QUOTE_TO_TRADE: leg_reports.append(market_buy_with_usdc(ETH_SYM, usdc, per_leg))
 
         elif target == 'BTC':
-            if a['UETH'] > 0.0:
-                rep = market_sell_all(ETH_SYM, MAX_SLIPPAGE_BPS)
-                leg_reports.append(rep)
+            if a['UETH'] > 0.0: leg_reports.append(market_sell_all(ETH_SYM, per_leg))
             usdc, _, _ = get_spot_balances()
-            if usdc > MIN_QUOTE_TO_TRADE:
-                rep = market_buy_with_usdc(BTC_SYM, usdc, MAX_SLIPPAGE_BPS)
-                leg_reports.append(rep)
+            if usdc > MIN_QUOTE_TO_TRADE: leg_reports.append(market_buy_with_usdc(BTC_SYM, usdc, per_leg))
 
         else:  # CASH
-            if a['UETH'] > 0.0:
-                rep = market_sell_all(ETH_SYM, MAX_SLIPPAGE_BPS)
-                leg_reports.append(rep)
-            if a['UBTC'] > 0.0:
-                rep = market_sell_all(BTC_SYM, MAX_SLIPPAGE_BPS)
-                leg_reports.append(rep)
+            if a['UETH'] > 0.0: leg_reports.append(market_sell_all(ETH_SYM, per_leg))
+            if a['UBTC'] > 0.0: leg_reports.append(market_sell_all(BTC_SYM, per_leg))
 
         _, after = get_account_value_usdc()
         if any(abs(after[k] - before[k]) > 1e-12 for k in ('UETH','UBTC','USDC')):
             changed = True
 
-    # Compose report
-    leg_lines = [ln for ln in map(_leg_line, leg_reports) if ln]
+    # time budget exhausted, check target
+    state, pct, total, a = get_state_and_percents()
+    reached = (
+        (target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT) or
+        (target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT) or
+        (target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT)
+    )
+    return (changed, compose_exec_msg(leg_reports), reached)
 
-    # New position split
+
+def compose_exec_msg(leg_reports: list) -> str:
+    leg_lines = [ln for ln in map(_leg_line, leg_reports) if ln]
     state, pct, total, a = get_state_and_percents()
     pos_line = _position_line(pct, a)
+    if leg_lines:
+        return " • ".join(leg_lines) + " | " + pos_line
+    return "No fills this cycle. " + pos_line
 
-    if changed and leg_lines:
-        msg = " • ".join(leg_lines) + " | " + pos_line
-    elif changed:
-        msg = "Rebalanced with minimal deltas. " + pos_line
-    else:
-        msg = "No fills this cycle. " + pos_line
-
-    logger.info(f"[EXECUTION] {msg}")
-    return changed, msg
 
 
 
@@ -719,8 +729,9 @@ def compute_signal(df: pd.DataFrame):
 # ---------------------- Main logic ----------------------
 def trade_logic():
     eth, btc = fetch_data()
-    m = align_candles(eth, btc).set_index('timestamp')  # aligned by time
+    m = align_candles(eth, btc).set_index('timestamp')
 
+    # rolling stats for triggers
     m['ETH_MA'] = m['ETH'].rolling(AVG).mean()
     m['ETH_SD'] = m['ETH'].rolling(AVG).std().clip(lower=1e-12)
     m['BTC_MA'] = m['BTC'].rolling(AVG).mean()
@@ -730,7 +741,6 @@ def trade_logic():
     m['R_SD']   = m['RATIO'].rolling(AVG).std().clip(lower=1e-12)
 
     target, diag, bar_ts = compute_signal(m)
-
     state, pct, total, a = get_state_and_percents()
 
     latest_row = m.iloc[-1]
@@ -745,21 +755,43 @@ def trade_logic():
     log_event("signal", f"Decision: {target} ({diag['reason']})",
               {**diag, "state_before": state, "pct": pct})
 
-    if target != state:
-        changed, exec_msg = rebalance_to_target(target)
-        global _last_trade_bar_ts
-        _last_trade_bar_ts = bar_ts
-        if changed:
-            send_message(f"{msg_prefix}\n{exec_msg}\n{trig_line}")
-        else:
-            send_message(f"{msg_prefix}\nAttempted rebalance to {target}, but no fills. {exec_msg}\n{trig_line}")
+    # --- TWAP orchestration ---
+    twap = load_twap_state()
+    now = time.time()
+
+    # Start a new TWAP if target changed OR there is no active TWAP
+    if not twap["active"] or twap["target"] != target:
+        twap = {"active": True, "target": target, "end_ts": now + GLOBAL_TWAP_TIME}
+        save_twap_state(twap)
+        logger.info(f"[TWAP] started target={target}, ends in {int(GLOBAL_TWAP_TIME)}s")
+
+    # If TWAP expired, finish it
+    if now >= twap["end_ts"]:
+        clear_twap_state()
+        send_message(f"{msg_prefix}\nTWAP window elapsed; finalizing. {trig_line}")
+        last_run["time"] = time.time(); last_run["status"] = "ok"
+        return
+
+    # Remaining time for this run
+    remaining = max(1.0, twap["end_ts"] - now)
+    # Use only a slice of remaining per run so we don’t monopolize the loop; e.g., at most 60s per call
+    per_run_budget = min(remaining, 60.0)
+
+    changed, exec_msg, reached = rebalance_to_target_twap(twap["target"], per_run_budget)
+    _last_trade_bar_ts = diag["bar_ts"]  # maintain your bar marker
+
+    if reached:
+        clear_twap_state()
+        send_message(f"{msg_prefix}\n{exec_msg}\n(TWAP reached target) {trig_line}")
     else:
-        send_message(msg_prefix + f"\nNo change (state={state}).\n{trig_line}")
-
-
+        # still in TWAP window; report progress
+        secs_left = int(twap["end_ts"] - time.time())
+        send_message(f"{msg_prefix}\n{exec_msg}\n(TWAP progress — {secs_left//3600}h {(secs_left%3600)//60}m left) {trig_line}")
 
     last_run["time"] = time.time()
     last_run["status"] = "ok"
+
+
 
 # ---------------------- Entrypoint ----------------------
 if __name__ == "__main__":
