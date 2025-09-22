@@ -74,7 +74,7 @@ TARGET_TOL_PCT       = float(os.getenv('TARGET_TOL_PCT', '0.99'))
 MAX_SLICES           = int(os.getenv('MAX_SLICES', '999'))
 SLICE_DELAY_SEC      = float(os.getenv('SLICE_DELAY_SEC', '0.5'))   # micro-TWAP pacing
 MAX_REBALANCE_STEPS  = int(os.getenv('MAX_REBALANCE_STEPS', '99'))
-SLEEP_SEC            = int(os.getenv('SLEEP_SEC', str(1 * 15 * 60)))
+SLEEP_SEC            = int(os.getenv('SLEEP_SEC', str(1 * 60 * 60)))
 TELEGRAM_SPAM_GUARD  = int(os.getenv('TELEGRAM_SPAM_GUARD', '1'))
 IMPACT_BPS_CAP     = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp price impact per slice
 MAX_SLICE_USD      = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
@@ -775,7 +775,7 @@ def trade_logic():
     # Remaining time for this run
     remaining = max(1.0, twap["end_ts"] - now)
     # Use only a slice of remaining per run so we don’t monopolize the loop; e.g., at most 60s per call
-    per_run_budget = min(remaining, 60.0)
+    per_run_budget = min(remaining, 1800.0)
 
     changed, exec_msg, reached = rebalance_to_target_twap(twap["target"], per_run_budget)
     _last_trade_bar_ts = diag["bar_ts"]  # maintain your bar marker
