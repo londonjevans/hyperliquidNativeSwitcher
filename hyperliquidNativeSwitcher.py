@@ -759,6 +759,24 @@ def trade_logic():
     twap = load_twap_state()
     now = time.time()
 
+    ABS_DUST_UETH = float(os.getenv('ABS_DUST_UETH','0.1'))
+    ABS_DUST_UBTC = float(os.getenv('ABS_DUST_UBTC','0.005'))
+
+    at_target = (
+    (target=='ETH'  and pct['ETH']  >= TARGET_TOL_PCT) or
+    (target=='BTC'  and pct['BTC']  >= TARGET_TOL_PCT) or
+    (target=='CASH' and pct['USDC'] >= TARGET_TOL_PCT) or
+    (target=='CASH' and a['UETH']<=ABS_DUST_UETH and a['UBTC']<=ABS_DUST_UBTC)
+    )
+
+    if at_target:
+        # ensure no stale twap state hangs around
+        clear_twap_state()
+        send_message(f"{msg_prefix}\nAlready at target ({target}).\n{trig_line}")
+        last_run["time"] = time.time()
+        last_run["status"] = "ok"
+        return
+
     # Start a new TWAP if target changed OR there is no active TWAP
     if not twap["active"] or twap["target"] != target:
         twap = {"active": True, "target": target, "end_ts": now + GLOBAL_TWAP_TIME}
