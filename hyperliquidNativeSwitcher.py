@@ -775,7 +775,7 @@ def trade_logic():
     # Remaining time for this run
     remaining = max(1.0, twap["end_ts"] - now)
     # Use only a slice of remaining per run so we don’t monopolize the loop; e.g., at most 60s per call
-    per_run_budget = min(remaining, 1800.0)
+    per_run_budget = min(remaining, 3500.0)
 
     changed, exec_msg, reached = rebalance_to_target_twap(twap["target"], per_run_budget)
     _last_trade_bar_ts = diag["bar_ts"]  # maintain your bar marker
