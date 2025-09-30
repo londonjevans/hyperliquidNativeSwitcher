@@ -5,4 +5,4 @@ requests
 flask
 eth-account
 hyperliquid-python-sdk
-
+redis>=5

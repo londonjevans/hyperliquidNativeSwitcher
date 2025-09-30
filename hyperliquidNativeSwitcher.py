@@ -9,6 +9,8 @@ Policy (best-performing stats from backtests):
   BTC if z_ratio < -RATIO_NEUTRAL, otherwise KEEP CURRENT (if flat, fall back to sign).
 - Risk-off (USDC) only when BOTH are not strong.
 - 100% allocation to one coin or cash (no partial tilts).
+- HYSTERESIS: After entering position at trigger/entry price, require 1% move below entry before exiting
+- BAR COOLDOWN: Prevents multiple executions on the same daily bar
 
 Includes:
 - Timestamp-aligned candles
@@ -17,6 +19,9 @@ Includes:
 - Rotating logs + orders.csv + events.csv
 - /health endpoint
 - Micro-TWAP slicing via MAX_SLICES and optional SLICE_DELAY_SEC per slice
+- Hysteresis gate to prevent whipsaw around trigger levels
+- Per-bar execution limit to prevent overtrading
+- Redis-backed state + distributed lock for safe scaling on Railway
 """
 
 import os, time, uuid, csv, json
@@ -28,6 +33,7 @@ import pandas as pd
 import numpy as np
 import requests
 import ccxt
+import redis  # NEW: Redis for state + lock
 
 from flask import Flask
 import threading
@@ -76,14 +82,25 @@ SLICE_DELAY_SEC      = float(os.getenv('SLICE_DELAY_SEC', '0.5'))   # micro-TWAP
 MAX_REBALANCE_STEPS  = int(os.getenv('MAX_REBALANCE_STEPS', '99'))
 SLEEP_SEC            = int(os.getenv('SLEEP_SEC', str(1 * 60 * 60)))
 TELEGRAM_SPAM_GUARD  = int(os.getenv('TELEGRAM_SPAM_GUARD', '1'))
-IMPACT_BPS_CAP     = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp price impact per slice
-MAX_SLICE_USD      = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
-SLICE_TIME_BUDGET  = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
+IMPACT_BPS_CAP       = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp price impact per slice
+MAX_SLICE_USD        = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
+SLICE_TIME_BUDGET    = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
 
 GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(1 * 59 * 60)))  # default 6 hours
 
-TWAP_STATE_FILE = "twap_state.json"
+# Hysteresis parameters
+HYSTERESIS_PCT = float(os.getenv('HYSTERESIS_PCT', '0.01'))  # 1% buffer by default
 
+# ---- Redis config (Railway) ----
+REDIS_URL = os.getenv("REDIS_URL", "").strip()
+if not REDIS_URL:
+    raise SystemExit("Set REDIS_URL to a Railway Redis instance.")
+rds = redis.from_url(REDIS_URL, decode_responses=True)
+
+TWAP_KEY   = "hl:twap_state"
+TRIG_KEY   = "hl:trigger_state"
+LOCK_KEY   = "hl:rebalance_lock"
+LOCK_TTL_S = 4200  # ~70 minutes; released manually after each loop
 
 assert HL_WALLET_ADDRESS and HL_PRIVATE_KEY, "Set HL_WALLET_ADDRESS and HL_PRIVATE_KEY."
 
@@ -100,8 +117,6 @@ agent_account = Account.from_key(_api_pk)
 
 # IMPORTANT: pass the agent (API wallet) account, the API URL, and your MAIN account address
 hl_exch = Exchange(agent_account, API_URL, account_address=HL_WALLET_ADDRESS)
-
-
 
 # ---------------------- Exchange ----------------------
 exchange = ccxt.hyperliquid({
@@ -150,28 +165,35 @@ try:
 except Exception as e:
     raise SystemExit(f"[PRECHECK] Spot balance failed for API wallet {API_WALLET_ADDRESS}: {e}")
 
+# ---------------------- Redis-backed state helpers ----------------------
 def load_twap_state():
-    try:
-        with open(TWAP_STATE_FILE, "r") as f:
-            st = json.load(f)
-            # normalize
-            st["end_ts"] = float(st.get("end_ts", 0.0))
-            st["target"] = st.get("target")
-            st["active"] = bool(st.get("active", False))
-            return st
-    except Exception:
-        return {"active": False, "target": None, "end_ts": 0.0}
+    v = rds.get(TWAP_KEY)
+    if not v:
+        return {"active": False, "target": None, "end_ts": 0.0, "start_bar_ts": None}
+    st = json.loads(v)
+    st["end_ts"] = float(st.get("end_ts", 0.0))
+    st["target"] = st.get("target")
+    st["active"] = bool(st.get("active", False))
+    st["start_bar_ts"] = st.get("start_bar_ts")
+    return st
 
 def save_twap_state(state: dict):
-    try:
-        with open(TWAP_STATE_FILE, "w") as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+    rds.set(TWAP_KEY, json.dumps(state))
 
 def clear_twap_state():
-    save_twap_state({"active": False, "target": None, "end_ts": 0.0})
+    rds.delete(TWAP_KEY)
 
+def load_trigger_state():
+    v = rds.get(TRIG_KEY)
+    return json.loads(v) if v else None
+
+def save_trigger_state(trigger_data: dict):
+    rds.set(TRIG_KEY, json.dumps(trigger_data))
+
+def clear_trigger_state():
+    rds.delete(TRIG_KEY)
+
+# ---------------------- Utilities ----------------------
 def _fmt_usd(x: float) -> str:
     return f"${x:,.2f}"
 
@@ -254,8 +276,6 @@ def format_triggers_msg(tr: dict) -> str:
         f"(now ETH={_fmt_usd(ETH)})"
     )
 
-
-
 def _append_csv(path: Path, header: list, row: list):
     new = not path.exists()
     with path.open("a", newline="") as f:
@@ -290,24 +310,32 @@ def log_order(row: dict):
 
 # ---------------------- Telegram ----------------------
 _last_sent = 0
-def send_message(message: str):
+def send_message(message: str, priority: bool = False):
     global _last_sent
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    if TELEGRAM_SPAM_GUARD and (time.time() - _last_sent < 10):
+    
+    # Priority messages bypass spam guard (for completion notifications)
+    if not priority and TELEGRAM_SPAM_GUARD and (time.time() - _last_sent < 10):
+        logger.info(f"[TELEGRAM] Message blocked by spam guard: {message[:100]}...")
         return
+    
     _last_sent = time.time()
 
     wallet_tag = f"[{HL_WALLET_ADDRESS[:6]}…{HL_WALLET_ADDRESS[-4:]}]"
     msg = f"{wallet_tag} {message}"
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             data={"chat_id": TELEGRAM_CHAT_ID, "text": str(msg)},
             timeout=10,
         )
+        if resp.status_code == 200:
+            logger.info(f"[TELEGRAM] Message sent successfully")
+        else:
+            logger.warning(f"[TELEGRAM] Send failed: {resp.status_code} {resp.text}")
     except Exception as e:
-        logger.warning(f"Telegram post failed: {e}")
+        logger.warning(f"[TELEGRAM] Post failed: {e}")
 
 # ---------------------- Data / balances ----------------------
 def fetch_data(interval='1d', lookback=max(AVG*4, 50)):
@@ -418,9 +446,6 @@ def plan_sell(symbol: str, base_available: float, max_slippage_bps: int, fee_rat
     }
 
 # ---------------------- IOC bounded execution ----------------------
-
-
-
 def place_ioc_limit(symbol, side, base_amount, limit_price):
     """
     Place a spot IOC limit using the SDK 'order' interface, always on spot.
@@ -439,7 +464,7 @@ def place_ioc_limit(symbol, side, base_amount, limit_price):
         return {"id": None, "status": "dry_run", "filled": 0.0, "average": None, "info": {}}, cloid
 
     try:
-        # SDK spot order (per the docs snippet you pasted)
+        # SDK spot order
         resp = hl_exch.order(sdk_symbol, (side == 'buy'), qty, px, {"limit": {"tif": tif}})
     except Exception as e:
         logger.error(f"[ORDER ERROR] {side.upper()} {sdk_symbol} failed: {e}")
@@ -452,7 +477,7 @@ def place_ioc_limit(symbol, side, base_amount, limit_price):
         send_message(f"ORDER ERROR: status={status}")
         raise RuntimeError(f"Order rejected: {resp}")
 
-    # Normalize for logging; IOC may return fill info in response['response']['data']['statuses'][0]
+    # Normalize for logging
     order = {
         "id":      resp.get("order_id") if isinstance(resp, dict) else None,
         "status":  status,
@@ -510,7 +535,6 @@ def market_sell_all(symbol: str, time_budget_sec: float):
         "total_base":total_base_filled,"total_usdc":total_usdc_proceeds
     }
 
-
 def market_buy_with_usdc(symbol: str, usdc_to_spend: float, time_budget_sec: float):
     fee = taker_fee(symbol)
     slices = []
@@ -560,8 +584,6 @@ def market_buy_with_usdc(symbol: str, usdc_to_spend: float, time_budget_sec: flo
         "total_base":total_base_bought,"total_usdc":total_usdc_spent
     }
 
-
-
 # ---------------------- State / rebalancing ----------------------
 def get_state_and_percents():
     total, a = get_account_value_usdc()
@@ -575,10 +597,10 @@ def get_state_and_percents():
     else: state = 'MIXED'
     return state, {'ETH': pct_eth, 'BTC': pct_btc, 'USDC': pct_usd}, total, a
 
-def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool, str, bool]:
+def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool, str, bool, list]:
     """
     Rebalance toward target for up to time_budget_sec seconds.
-    Returns (changed_any, message, reached_target_bool).
+    Returns (changed_any, message, reached_target_bool, leg_reports).
     """
     changed = False
     leg_reports = []
@@ -590,9 +612,9 @@ def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool,
 
         state, pct, total, a = get_state_and_percents()
         # stop if target reached
-        if target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True)
-        if target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True)
-        if target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True)
+        if target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True, leg_reports)
+        if target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True, leg_reports)
+        if target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True, leg_reports)
 
         before = a.copy()
 
@@ -624,8 +646,7 @@ def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool,
         (target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT) or
         (target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT)
     )
-    return (changed, compose_exec_msg(leg_reports), reached)
-
+    return (changed, compose_exec_msg(leg_reports), reached, leg_reports)
 
 def compose_exec_msg(leg_reports: list) -> str:
     leg_lines = [ln for ln in map(_leg_line, leg_reports) if ln]
@@ -634,13 +655,6 @@ def compose_exec_msg(leg_reports: list) -> str:
     if leg_lines:
         return " • ".join(leg_lines) + " | " + pos_line
     return "No fills this cycle. " + pos_line
-
-
-
-
-
-
-
 
 # ---------------------- Signals ----------------------
 _last_trade_bar_ts = None  # cooldown by bar time
@@ -748,6 +762,41 @@ def trade_logic():
     trig_line = format_triggers_msg(triggers)
     logger.info(f"[TRIGGERS] {trig_line}")
 
+    # --- HYSTERESIS GATE ---
+    last_trigger = load_trigger_state()
+    
+    # Check if we're trying to exit a position
+    if target != state and state in ('ETH', 'BTC') and last_trigger is not None:
+        trigger_asset = last_trigger.get("asset")
+        trigger_price = float(last_trigger.get("price", 0.0))
+        
+        # Only apply hysteresis if we're exiting the same asset we entered
+        if trigger_asset == state and trigger_price > 0.0:
+            current_price = triggers["current"][trigger_asset]
+            exit_threshold = trigger_price * (1 - HYSTERESIS_PCT)
+            
+            if current_price > exit_threshold:
+                logger.info(
+                    f"[HYSTERESIS] Blocking exit from {state}. "
+                    f"Current {trigger_asset} price {_fmt_usd(current_price)} is above "
+                    f"exit threshold {_fmt_usd(exit_threshold)} "
+                    f"(entry {_fmt_usd(trigger_price)} - {HYSTERESIS_PCT*100:.2f}%)"
+                )
+                target = state  # Stay in current position
+                diag["reason"] = f"hysteresis_block: {trigger_asset} @ {_fmt_usd(current_price)} > exit_threshold {_fmt_usd(exit_threshold)}"
+                diag["hysteresis_active"] = True
+            else:
+                logger.info(
+                    f"[HYSTERESIS] Allowing exit from {state}. "
+                    f"Current {trigger_asset} price {_fmt_usd(current_price)} is below "
+                    f"exit threshold {_fmt_usd(exit_threshold)}"
+                )
+                diag["hysteresis_active"] = False
+        else:
+            diag["hysteresis_active"] = False
+    else:
+        diag["hysteresis_active"] = False
+
     ret = round((total - STARTING_VALUE) / max(STARTING_VALUE, 1e-9) * 100, 2)
     msg_prefix = (f"Equity ${total:,.2f} (ret {ret:+.2f}%) | "
                   f"USDC {a['USDC']:.2f} | UETH {a['UETH']:.6f} | UBTC {a['UBTC']:.6f}")
@@ -763,10 +812,10 @@ def trade_logic():
     ABS_DUST_UBTC = float(os.getenv('ABS_DUST_UBTC','0.005'))
 
     at_target = (
-    (target=='ETH'  and pct['ETH']  >= TARGET_TOL_PCT) or
-    (target=='BTC'  and pct['BTC']  >= TARGET_TOL_PCT) or
-    (target=='CASH' and pct['USDC'] >= TARGET_TOL_PCT) or
-    (target=='CASH' and a['UETH']<=ABS_DUST_UETH and a['UBTC']<=ABS_DUST_UBTC)
+        (target=='ETH'  and pct['ETH']  >= TARGET_TOL_PCT) or
+        (target=='BTC'  and pct['BTC']  >= TARGET_TOL_PCT) or
+        (target=='CASH' and pct['USDC'] >= TARGET_TOL_PCT) or
+        (target=='CASH' and a['UETH']<=ABS_DUST_UETH and a['UBTC']<=ABS_DUST_UBTC)
     )
 
     if at_target:
@@ -777,11 +826,24 @@ def trade_logic():
         last_run["status"] = "ok"
         return
 
+    # --- BAR COOLDOWN: Check if TWAP was started on current bar ---
+    if twap.get("active") and twap.get("start_bar_ts") == str(bar_ts):
+        logger.info(f"[COOLDOWN] Skipping execution - TWAP already active on this bar (started {twap.get('start_bar_ts')})")
+        send_message(f"{msg_prefix}\nTWAP in progress (started this bar), waiting for next bar.\n{trig_line}")
+        last_run["time"] = time.time()
+        last_run["status"] = "ok"
+        return
+
     # Start a new TWAP if target changed OR there is no active TWAP
     if not twap["active"] or twap["target"] != target:
-        twap = {"active": True, "target": target, "end_ts": now + GLOBAL_TWAP_TIME}
+        twap = {
+            "active": True, 
+            "target": target, 
+            "end_ts": now + GLOBAL_TWAP_TIME,
+            "start_bar_ts": str(bar_ts)  # Record which bar started this TWAP
+        }
         save_twap_state(twap)
-        logger.info(f"[TWAP] started target={target}, ends in {int(GLOBAL_TWAP_TIME)}s")
+        logger.info(f"[TWAP] started target={target}, ends in {int(GLOBAL_TWAP_TIME)}s, bar={bar_ts}")
 
     # If TWAP expired, finish it
     if now >= twap["end_ts"]:
@@ -792,15 +854,45 @@ def trade_logic():
 
     # Remaining time for this run
     remaining = max(1.0, twap["end_ts"] - now)
-    # Use only a slice of remaining per run so we don’t monopolize the loop; e.g., at most 60s per call
+    # Use only a slice of remaining per run; at most 3500s per call
     per_run_budget = min(remaining, 3500.0)
 
-    changed, exec_msg, reached = rebalance_to_target_twap(twap["target"], per_run_budget)
-    _last_trade_bar_ts = diag["bar_ts"]  # maintain your bar marker
+    changed, exec_msg, reached, leg_reports = rebalance_to_target_twap(twap["target"], per_run_budget)
+    # cooldown marker should use the bar Timestamp
+    global _last_trade_bar_ts
+    _last_trade_bar_ts = bar_ts
 
     if reached:
         clear_twap_state()
-        send_message(f"{msg_prefix}\n{exec_msg}\n(TWAP reached target) {trig_line}")
+
+        # --- SAVE REAL ENTRY PRICE FOR HYSTERESIS ---
+        def _weighted_avg_price(slices):
+            q = sum(s["base_filled"] for s in slices)
+            if q <= 1e-12:
+                return None
+            return sum(s["avg_px_realized"] * s["base_filled"] for s in slices) / q
+
+        entry_px = None
+        if twap["target"] == 'ETH':
+            buy_slices = [s for r in (leg_reports or []) if r and r.get("action")=="BUY" and r.get("symbol")==ETH_SYM for s in r.get("slices",[])]
+            entry_px = _weighted_avg_price(buy_slices) or get_price(ETH_SYM)
+            save_trigger_state({"asset": "ETH", "price": float(entry_px), "timestamp": time.time()})
+            logger.info(f"[TRIGGER] Saved ETH entry price for hysteresis: {_fmt_usd(entry_px)}")
+        elif twap["target"] == 'BTC':
+            buy_slices = [s for r in (leg_reports or []) if r and r.get("action")=="BUY" and r.get("symbol")==BTC_SYM for s in r.get("slices",[])]
+            entry_px = _weighted_avg_price(buy_slices) or get_price(BTC_SYM)
+            save_trigger_state({"asset": "BTC", "price": float(entry_px), "timestamp": time.time()})
+            logger.info(f"[TRIGGER] Saved BTC entry price for hysteresis: {_fmt_usd(entry_px)}")
+        elif twap["target"] == 'CASH':
+            clear_trigger_state()
+            logger.info("[TRIGGER] Cleared trigger state (moved to CASH)")
+        
+        # Count total fills
+        total_slices = sum(len(r.get("slices", [])) for r in (leg_reports or []) if r)
+        completion_msg = f"{msg_prefix}\n{exec_msg}\nTWAP COMPLETED ({total_slices} fills)\n{trig_line}"
+        send_message(completion_msg, priority=True)  # Bypass spam guard
+        log_event("twap_complete", f"TWAP completed for {twap['target']}", 
+                  {"fills": total_slices, "target": twap["target"]})
     else:
         # still in TWAP window; report progress
         secs_left = int(twap["end_ts"] - time.time())
@@ -809,20 +901,32 @@ def trade_logic():
     last_run["time"] = time.time()
     last_run["status"] = "ok"
 
-
-
 # ---------------------- Entrypoint ----------------------
 if __name__ == "__main__":
     start_health_server()
     log_event("start", f"Bot starting. DRY_RUN={DRY_RUN}, MAX_SLIPPAGE_BPS={MAX_SLIPPAGE_BPS}, "
                        f"MIN_QUOTE_TO_TRADE={MIN_QUOTE_TO_TRADE}, AVG={AVG}, Z_STRONG={Z_STRONG}, "
                        f"RATIO_NEUTRAL={RATIO_NEUTRAL}, TARGET_TOL_PCT={TARGET_TOL_PCT}, "
-                       f"MAX_SLICES={MAX_SLICES}, SLICE_DELAY_SEC={SLICE_DELAY_SEC}")
+                       f"MAX_SLICES={MAX_SLICES}, SLICE_DELAY_SEC={SLICE_DELAY_SEC}, "
+                       f"HYSTERESIS_PCT={HYSTERESIS_PCT}, GLOBAL_TWAP_TIME={GLOBAL_TWAP_TIME/3600:.1f}h")
     while True:
+        lock = rds.lock(LOCK_KEY, timeout=LOCK_TTL_S, blocking_timeout=5)
+        have_lock = False
         try:
-            trade_logic()
-        except Exception as e:
-            logger.exception(f"Top-level error: {e}")
-            send_message(f"Error: {e}")
-            last_run["status"] = "error"
+            have_lock = lock.acquire(blocking=True)
+            if have_lock:
+                try:
+                    trade_logic()
+                except Exception as e:
+                    logger.exception(f"Top-level error: {e}")
+                    send_message(f"Error: {e}")
+                    last_run["status"] = "error"
+            else:
+                logger.info("[LOCK] Could not acquire lock; another instance is active.")
+        finally:
+            if have_lock:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
         time.sleep(SLEEP_SEC)
