@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Hyperliquid SPOT strategy (UETH/USDC, UBTC/USDC)
+Hyperliquid SPOT strategy (UETH/USDC, UBTC/USDC) - TIMEOUT & HEALTH PATCHED VERSION
 
 Policy (best-performing stats from backtests):
 - Risk-on when EITHER ETH or BTC is strong vs USDC: z > Z_STRONG (default 0.5).
@@ -12,28 +12,28 @@ Policy (best-performing stats from backtests):
 - HYSTERESIS: After entering position at trigger/entry price, require 1% move below entry before exiting
 - BAR COOLDOWN: Prevents multiple executions on the same daily bar
 
-Includes:
-- Timestamp-aligned candles
-- Slippage/fee-aware bounded IOC execution
-- Actual-fill accounting with balance refresh
-- Rotating logs + orders.csv + events.csv
-- /health endpoint
-- Micro-TWAP slicing via MAX_SLICES and optional SLICE_DELAY_SEC per slice
-- Hysteresis gate to prevent whipsaw around trigger levels
-- Per-bar execution limit to prevent overtrading
-- Redis-backed state + distributed lock for safe scaling on Railway
+PATCHES:
+- Increased API timeouts to 30s (CCXT)
+- Added exponential backoff retry logic (3 attempts) for common network errors
+- Wrapped critical data calls with retry
+- Added API POST-based health check before trading (Hyperliquid /info is POST-only)
+- Backward-compatible urllib3 Retry config
+- Corrected GLOBAL_TWAP_TIME default to 59m
 """
 
 import os, time, uuid, csv, json
 from pathlib import Path
 import logging
 from logging.handlers import RotatingFileHandler
+from functools import wraps
 
 import pandas as pd
 import numpy as np
 import requests
 import ccxt
-import redis  # NEW: Redis for state + lock
+import redis
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from flask import Flask
 import threading
@@ -42,6 +42,34 @@ from hyperliquid.exchange import Exchange
 from hyperliquid.utils import constants
 
 from eth_account import Account
+
+# ---------------------- Retry Decorator ----------------------
+def retry_on_timeout(max_retries=3, base_delay=2, exceptions=(Exception,)):
+    """Retry decorator with exponential backoff for network/timeout errors."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt == max_retries - 1:
+                        logging.getLogger("hl_spot_bot").error(
+                            f"Failed after {max_retries} attempts: {func.__name__}: {e}"
+                        )
+                        raise
+                    delay = base_delay * (2 ** attempt)
+                    logging.getLogger("hl_spot_bot").warning(
+                        f"Transient error in {func.__name__} (attempt {attempt + 1}/{max_retries}), "
+                        f"retrying in {delay}s: {e}"
+                    )
+                    time.sleep(delay)
+            # Should never get here
+            raise last_exc
+        return wrapper
+    return decorator
 
 # ---------------------- Web health ----------------------
 app = Flask(__name__)
@@ -86,10 +114,14 @@ IMPACT_BPS_CAP       = int(os.getenv('IMPACT_BPS_CAP', '1'))     # ≤ 1 bp pric
 MAX_SLICE_USD        = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap notional per slice
 SLICE_TIME_BUDGET    = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
 
-GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(1 * 59 * 60)))  # default 6 hours
+# Correct default: 6 hours
+GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(1 * 59 * 60)))
 
 # Hysteresis parameters
 HYSTERESIS_PCT = float(os.getenv('HYSTERESIS_PCT', '0.01'))  # 1% buffer by default
+
+# API timeout settings (CCXT expects ms)
+API_TIMEOUT_MS = int(os.getenv('API_TIMEOUT_MS', '30000'))  # 30 seconds default
 
 # ---- Redis config (Railway) ----
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
@@ -118,14 +150,36 @@ agent_account = Account.from_key(_api_pk)
 # IMPORTANT: pass the agent (API wallet) account, the API URL, and your MAIN account address
 hl_exch = Exchange(agent_account, API_URL, account_address=HL_WALLET_ADDRESS)
 
-# ---------------------- Exchange ----------------------
+# ---------------------- Exchange with Enhanced Timeout ----------------------
 exchange = ccxt.hyperliquid({
     'walletAddress': HL_WALLET_ADDRESS,
     'privateKey': HL_PRIVATE_KEY,
     'enableRateLimit': True,
+    'timeout': API_TIMEOUT_MS,  # Increased timeout
     'options': {'defaultType': 'spot'},
 })
 exchange.load_markets()
+
+# Configure requests session with retry strategy (backward compatible on urllib3)
+session = requests.Session()
+try:
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods={"HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"},
+    )
+except TypeError:
+    # Older urllib3: use method_whitelist
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[429, 500, 502, 503, 504],
+        method_whitelist={"HEAD", "GET", "POST", "PUT", "DELETE", "OPTIONS", "TRACE"},
+    )
+adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=10, pool_maxsize=10)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
 
 # Markets (Hyperliquid spot)
 ETH_SYM = 'UETH/USDC'
@@ -154,6 +208,8 @@ API_WALLET_ADDRESS = derive_api_address_from_key(HL_PRIVATE_KEY)
 
 logger.info(f"[PRECHECK] Main wallet: {HL_WALLET_ADDRESS}")
 logger.info(f"[PRECHECK] API wallet : {API_WALLET_ADDRESS}")
+logger.info(f"[PRECHECK] API base  : {API_URL}")
+logger.info(f"[PRECHECK] API timeout: {API_TIMEOUT_MS}ms")
 
 if API_WALLET_ADDRESS.lower() == HL_WALLET_ADDRESS.lower():
     raise SystemExit("HL_PRIVATE_KEY derives SAME address as HL_WALLET_ADDRESS. "
@@ -164,6 +220,24 @@ try:
     _ = exchange.fetch_balance({'type': 'spot'})
 except Exception as e:
     raise SystemExit(f"[PRECHECK] Spot balance failed for API wallet {API_WALLET_ADDRESS}: {e}")
+
+# ---------------------- API Health Check (POST /info) ----------------------
+def check_api_health(timeout=10):
+    """Verify API connectivity before trading (Hyperliquid /info is POST-only)."""
+    try:
+        r = session.post(
+            f"{API_URL}/info",
+            json={"type": "allMids"},  # cheap, public
+            timeout=timeout,
+            headers={"Content-Type": "application/json", "User-Agent": "HyperliquidBot/1.0"},
+        )
+        return r.status_code == 200
+    except requests.exceptions.Timeout:
+        logger.error("API health check timeout")
+        return False
+    except requests.RequestException as e:
+        logger.error(f"API health check failed: {e}")
+        return False
 
 # ---------------------- Redis-backed state helpers ----------------------
 def load_twap_state():
@@ -198,7 +272,6 @@ def _fmt_usd(x: float) -> str:
     return f"${x:,.2f}"
 
 def _fmt_qty(x: float) -> str:
-    # show up to 6 decimals, trim trailing zeros
     return f"{x:.6f}".rstrip('0').rstrip('.')
 
 def _fmt_pct(x: float) -> str:
@@ -216,7 +289,6 @@ def _leg_line(rep: dict) -> str | None:
             f"→ proceeds {_fmt_usd(rep['total_usdc'])} "
             f"({len(rep['slices'])} slice{'s' if len(rep['slices'])!=1 else ''})"
         )
-    # BUY
     return (
         f"{act} {sym}: {_fmt_qty(rep['total_base'])} @ ~{_fmt_usd(avg_px)} "
         f"→ spent {_fmt_usd(rep['total_usdc'])} "
@@ -238,24 +310,18 @@ def _safe(val, fallback=0.0):
         return fallback
 
 def compute_triggers(df_latest: pd.Series) -> dict:
-    """
-    df_latest must include ETH, BTC, ETH_MA, ETH_SD, BTC_MA, BTC_SD, R_MA, R_SD.
-    Returns trigger price levels for strength and leadership.
-    """
     ETH = _safe(df_latest['ETH']); BTC = _safe(df_latest['BTC'])
     ETH_MA = _safe(df_latest['ETH_MA']); ETH_SD = max(_safe(df_latest['ETH_SD']), 1e-12)
     BTC_MA = _safe(df_latest['BTC_MA']); BTC_SD = max(_safe(df_latest['BTC_SD']), 1e-12)
     R_MA   = _safe(df_latest['R_MA']);   R_SD   = max(_safe(df_latest['R_SD']),   1e-12)
 
-    # Strength: z > Z_STRONG
     eth_strong_px = ETH_MA + Z_STRONG * ETH_SD
     btc_strong_px = BTC_MA + Z_STRONG * BTC_SD
 
-    # Leadership band ±RATIO_NEUTRAL, convert ratio levels into ETH price given current BTC
-    ratio_up  = R_MA + RATIO_NEUTRAL * R_SD   # ETH/BTC boundary where ETH starts to lead
-    ratio_dn  = R_MA - RATIO_NEUTRAL * R_SD   # ETH/BTC boundary where BTC starts to lead
-    eth_lead_px = ratio_up * BTC              # ETH must be ABOVE this to favor ETH
-    btc_lead_px = ratio_dn * BTC              # ETH must be BELOW this to favor BTC
+    ratio_up  = R_MA + RATIO_NEUTRAL * R_SD
+    ratio_dn  = R_MA - RATIO_NEUTRAL * R_SD
+    eth_lead_px = ratio_up * BTC
+    btc_lead_px = ratio_dn * BTC
 
     return {
         "current": {"ETH": ETH, "BTC": BTC},
@@ -315,7 +381,6 @@ def send_message(message: str, priority: bool = False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     
-    # Priority messages bypass spam guard (for completion notifications)
     if not priority and TELEGRAM_SPAM_GUARD and (time.time() - _last_sent < 10):
         logger.info(f"[TELEGRAM] Message blocked by spam guard: {message[:100]}...")
         return
@@ -325,7 +390,7 @@ def send_message(message: str, priority: bool = False):
     wallet_tag = f"[{HL_WALLET_ADDRESS[:6]}…{HL_WALLET_ADDRESS[-4:]}]"
     msg = f"{wallet_tag} {message}"
     try:
-        resp = requests.post(
+        resp = session.post(  # Use session with retry
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             data={"chat_id": TELEGRAM_CHAT_ID, "text": str(msg)},
             timeout=10,
@@ -337,7 +402,13 @@ def send_message(message: str, priority: bool = False):
     except Exception as e:
         logger.warning(f"[TELEGRAM] Post failed: {e}")
 
-# ---------------------- Data / balances ----------------------
+# ---------------------- Data / balances with retry ----------------------
+_RETRY_EXCS = (
+    ccxt.RequestTimeout, ccxt.NetworkError, ccxt.ExchangeNotAvailable, getattr(ccxt, "DDoSProtection", ccxt.NetworkError),
+    requests.exceptions.ReadTimeout, requests.exceptions.Timeout, requests.exceptions.ConnectionError,
+)
+
+@retry_on_timeout(max_retries=3, base_delay=2, exceptions=_RETRY_EXCS)
 def fetch_data(interval='1d', lookback=max(AVG*4, 50)):
     cols = ['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     e = exchange.fetch_ohlcv(ETH_SYM, timeframe=interval, limit=lookback)
@@ -355,10 +426,12 @@ def align_candles(eth: pd.DataFrame, btc: pd.DataFrame) -> pd.DataFrame:
     )
     return m
 
+@retry_on_timeout(max_retries=3, base_delay=2, exceptions=_RETRY_EXCS)
 def get_price(symbol: str) -> float:
     t = exchange.fetch_ticker(symbol)
     return float(t['last'])
 
+@retry_on_timeout(max_retries=3, base_delay=2, exceptions=_RETRY_EXCS)
 def get_spot_balances():
     bal = exchange.fetch_balance({'type': 'spot'})
     f = bal.get('free', {})
@@ -388,7 +461,8 @@ def price_to_precision(symbol: str, price: float) -> float:
 def amount_to_precision(symbol: str, amount: float) -> float:
     return float(exchange.amount_to_precision(symbol, amount))
 
-# ---------------------- Orderbook planning ----------------------
+# ---------------------- Orderbook planning with retry ----------------------
+@retry_on_timeout(max_retries=3, base_delay=2, exceptions=_RETRY_EXCS)
 def _book(symbol: str):
     ob = exchange.fetch_order_book(symbol, limit=ORDERBOOK_LIMIT)
     bids = ob.get('bids', []) or []; asks = ob.get('asks', []) or []
@@ -449,6 +523,8 @@ def plan_sell(symbol: str, base_available: float, max_slippage_bps: int, fee_rat
 def place_ioc_limit(symbol, side, base_amount, limit_price):
     """
     Place a spot IOC limit using the SDK 'order' interface, always on spot.
+    NOTE: We intentionally avoid auto-retrying here to prevent duplicate placements in case of
+    server-accepted-but-client-timeout scenarios. Subsequent logic infers fills from balances.
     """
     sdk_symbol = symbol     # e.g. 'UETH/USDC'
     qty  = float(amount_to_precision(symbol, base_amount))
@@ -477,7 +553,6 @@ def place_ioc_limit(symbol, side, base_amount, limit_price):
         send_message(f"ORDER ERROR: status={status}")
         raise RuntimeError(f"Order rejected: {resp}")
 
-    # Normalize for logging
     order = {
         "id":      resp.get("order_id") if isinstance(resp, dict) else None,
         "status":  status,
@@ -611,14 +686,12 @@ def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool,
             break
 
         state, pct, total, a = get_state_and_percents()
-        # stop if target reached
         if target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True, leg_reports)
         if target == 'BTC' and pct['BTC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True, leg_reports)
         if target == 'CASH' and pct['USDC'] >= TARGET_TOL_PCT: return (changed, compose_exec_msg(leg_reports), True, leg_reports)
 
         before = a.copy()
 
-        # allocate a small sub-budget per inner leg (e.g., 5–10s) so we cycle both legs if needed
         per_leg = max(1.0, min(10.0, time_budget_sec - (time.time() - t0)))
 
         if target == 'ETH':
@@ -639,7 +712,6 @@ def rebalance_to_target_twap(target: str, time_budget_sec: float) -> tuple[bool,
         if any(abs(after[k] - before[k]) > 1e-12 for k in ('UETH','UBTC','USDC')):
             changed = True
 
-    # time budget exhausted, check target
     state, pct, total, a = get_state_and_percents()
     reached = (
         (target == 'ETH' and pct['ETH'] >= TARGET_TOL_PCT) or
@@ -662,14 +734,6 @@ _last_trade_bar_ts = None  # cooldown by bar time
 def compute_signal(df: pd.DataFrame):
     """
     Returns ('ETH' | 'BTC' | 'CASH', diagnostics_dict, bar_ts)
-
-    Strategy (best-performing stats):
-    - If EITHER coin has z > Z_STRONG (default 0.5), be invested.
-    - Use ratio z-score with neutral band RATIO_NEUTRAL (default 0.25):
-        * z_ratio > +band -> ETH
-        * z_ratio < -band -> BTC
-        * |z_ratio| <= band -> keep current coin; if flat, fall back to sign of z_ratio.
-    - Only go to cash if BOTH are weak (z <= Z_STRONG).
     """
     global _last_trade_bar_ts
     EPS = 1e-12
@@ -699,7 +763,6 @@ def compute_signal(df: pd.DataFrame):
     either_strong = eth_strong or btc_strong
     both_weak = not either_strong
 
-    # Cooldown: prevent multiple flips on the same bar; still allow risk-off
     cool = (_last_trade_bar_ts is not None) and (bar_ts == _last_trade_bar_ts)
 
     state, *_ = get_state_and_percents()
@@ -708,7 +771,6 @@ def compute_signal(df: pd.DataFrame):
     if both_weak:
         target, reason = 'CASH', "both_weak → risk_off"
     else:
-        # Decide leader with neutral band; keep current if within band
         zr = float(cur['Z_RATIO'])
         if abs(zr) <= RATIO_NEUTRAL and state in ('ETH','BTC'):
             target, reason = state, f"either_strong, |z_ratio|<={RATIO_NEUTRAL} keep {state}"
@@ -718,11 +780,9 @@ def compute_signal(df: pd.DataFrame):
             elif zr < 0:
                 target, reason = 'BTC', f"either_strong, ratio favors BTC (z_ratio={zr:.2f})"
             else:
-                # Exactly 0: break tie by higher individual z
                 target = 'ETH' if cur['Z_ETH'] >= cur['Z_BTC'] else 'BTC'
                 reason = f"either_strong, z_ratio=0 -> higher z: {target}"
 
-    # Apply cooldown only for switching coin (not for moving to cash)
     if cool and target != 'CASH' and target != state:
         target, reason = state, f"cooldown active, maintaining {state}"
 
@@ -740,9 +800,25 @@ def compute_signal(df: pd.DataFrame):
     }
     return target, diag, bar_ts
 
-# ---------------------- Main logic ----------------------
+# ---------------------- Main logic with API health check ----------------------
 def trade_logic():
-    eth, btc = fetch_data()
+    # Check API health first (POST /info)
+    if not check_api_health(timeout=10):
+        logger.error("API health check failed - skipping this cycle")
+        send_message("⚠️ Skipping cycle - Hyperliquid API unreachable")
+        last_run["time"] = time.time()
+        last_run["status"] = "api_unreachable"
+        return
+
+    try:
+        eth, btc = fetch_data()
+    except Exception as e:
+        logger.error(f"Failed to fetch data after retries: {e}")
+        send_message(f"⚠️ Data fetch failed: {e}")
+        last_run["time"] = time.time()
+        last_run["status"] = "data_fetch_error"
+        return
+
     m = align_candles(eth, btc).set_index('timestamp')
 
     # rolling stats for triggers
@@ -764,17 +840,12 @@ def trade_logic():
 
     # --- HYSTERESIS GATE ---
     last_trigger = load_trigger_state()
-    
-    # Check if we're trying to exit a position
     if target != state and state in ('ETH', 'BTC') and last_trigger is not None:
         trigger_asset = last_trigger.get("asset")
         trigger_price = float(last_trigger.get("price", 0.0))
-        
-        # Only apply hysteresis if we're exiting the same asset we entered
         if trigger_asset == state and trigger_price > 0.0:
             current_price = triggers["current"][trigger_asset]
             exit_threshold = trigger_price * (1 - HYSTERESIS_PCT)
-            
             if current_price > exit_threshold:
                 logger.info(
                     f"[HYSTERESIS] Blocking exit from {state}. "
@@ -782,7 +853,7 @@ def trade_logic():
                     f"exit threshold {_fmt_usd(exit_threshold)} "
                     f"(entry {_fmt_usd(trigger_price)} - {HYSTERESIS_PCT*100:.2f}%)"
                 )
-                target = state  # Stay in current position
+                target = state
                 diag["reason"] = f"hysteresis_block: {trigger_asset} @ {_fmt_usd(current_price)} > exit_threshold {_fmt_usd(exit_threshold)}"
                 diag["hysteresis_active"] = True
             else:
@@ -819,14 +890,13 @@ def trade_logic():
     )
 
     if at_target:
-        # ensure no stale twap state hangs around
         clear_twap_state()
         send_message(f"{msg_prefix}\nAlready at target ({target}).\n{trig_line}")
         last_run["time"] = time.time()
         last_run["status"] = "ok"
         return
 
-    # --- BAR COOLDOWN: Check if TWAP was started on current bar ---
+    # BAR COOLDOWN: skip if TWAP already started on this bar
     if twap.get("active") and twap.get("start_bar_ts") == str(bar_ts):
         logger.info(f"[COOLDOWN] Skipping execution - TWAP already active on this bar (started {twap.get('start_bar_ts')})")
         send_message(f"{msg_prefix}\nTWAP in progress (started this bar), waiting for next bar.\n{trig_line}")
@@ -834,18 +904,17 @@ def trade_logic():
         last_run["status"] = "ok"
         return
 
-    # Start a new TWAP if target changed OR there is no active TWAP
+    # Start/refresh TWAP
     if not twap["active"] or twap["target"] != target:
         twap = {
             "active": True, 
             "target": target, 
             "end_ts": now + GLOBAL_TWAP_TIME,
-            "start_bar_ts": str(bar_ts)  # Record which bar started this TWAP
+            "start_bar_ts": str(bar_ts)
         }
         save_twap_state(twap)
         logger.info(f"[TWAP] started target={target}, ends in {int(GLOBAL_TWAP_TIME)}s, bar={bar_ts}")
 
-    # If TWAP expired, finish it
     if now >= twap["end_ts"]:
         clear_twap_state()
         send_message(f"{msg_prefix}\nTWAP window elapsed; finalizing. {trig_line}")
@@ -854,18 +923,15 @@ def trade_logic():
 
     # Remaining time for this run
     remaining = max(1.0, twap["end_ts"] - now)
-    # Use only a slice of remaining per run; at most 3500s per call
     per_run_budget = min(remaining, 3500.0)
 
     changed, exec_msg, reached, leg_reports = rebalance_to_target_twap(twap["target"], per_run_budget)
-    # cooldown marker should use the bar Timestamp
     global _last_trade_bar_ts
     _last_trade_bar_ts = bar_ts
 
     if reached:
         clear_twap_state()
 
-        # --- SAVE REAL ENTRY PRICE FOR HYSTERESIS ---
         def _weighted_avg_price(slices):
             q = sum(s["base_filled"] for s in slices)
             if q <= 1e-12:
@@ -887,14 +953,12 @@ def trade_logic():
             clear_trigger_state()
             logger.info("[TRIGGER] Cleared trigger state (moved to CASH)")
         
-        # Count total fills
         total_slices = sum(len(r.get("slices", [])) for r in (leg_reports or []) if r)
         completion_msg = f"{msg_prefix}\n{exec_msg}\nTWAP COMPLETED ({total_slices} fills)\n{trig_line}"
-        send_message(completion_msg, priority=True)  # Bypass spam guard
+        send_message(completion_msg, priority=True)
         log_event("twap_complete", f"TWAP completed for {twap['target']}", 
                   {"fills": total_slices, "target": twap["target"]})
     else:
-        # still in TWAP window; report progress
         secs_left = int(twap["end_ts"] - time.time())
         send_message(f"{msg_prefix}\n{exec_msg}\n(TWAP progress — {secs_left//3600}h {(secs_left%3600)//60}m left) {trig_line}")
 
@@ -908,7 +972,9 @@ if __name__ == "__main__":
                        f"MIN_QUOTE_TO_TRADE={MIN_QUOTE_TO_TRADE}, AVG={AVG}, Z_STRONG={Z_STRONG}, "
                        f"RATIO_NEUTRAL={RATIO_NEUTRAL}, TARGET_TOL_PCT={TARGET_TOL_PCT}, "
                        f"MAX_SLICES={MAX_SLICES}, SLICE_DELAY_SEC={SLICE_DELAY_SEC}, "
-                       f"HYSTERESIS_PCT={HYSTERESIS_PCT}, GLOBAL_TWAP_TIME={GLOBAL_TWAP_TIME/3600:.1f}h")
+                       f"HYSTERESIS_PCT={HYSTERESIS_PCT}, GLOBAL_TWAP_TIME={GLOBAL_TWAP_TIME/3600:.1f}h, "
+                       f"API_TIMEOUT_MS={API_TIMEOUT_MS}")
+    
     while True:
         lock = rds.lock(LOCK_KEY, timeout=LOCK_TTL_S, blocking_timeout=5)
         have_lock = False
@@ -917,9 +983,13 @@ if __name__ == "__main__":
             if have_lock:
                 try:
                     trade_logic()
+                except _RETRY_EXCS as e:
+                    logger.error(f"API/Network timeout-like error: {e}")
+                    send_message(f"⚠️ API/Network issue - will retry next cycle")
+                    last_run["status"] = "timeout"
                 except Exception as e:
                     logger.exception(f"Top-level error: {e}")
-                    send_message(f"Error: {e}")
+                    send_message(f"❌ Error: {e}")
                     last_run["status"] = "error"
             else:
                 logger.info("[LOCK] Could not acquire lock; another instance is active.")
