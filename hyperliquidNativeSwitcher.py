@@ -783,7 +783,7 @@ def compute_signal(df: pd.DataFrame):
                 target = 'ETH' if cur['Z_ETH'] >= cur['Z_BTC'] else 'BTC'
                 reason = f"either_strong, z_ratio=0 -> higher z: {target}"
 
-    if cool and target != 'CASH' and target != state:
+    if cool and target != 'CASH' and target != state and state in ('ETH', 'BTC'):
         target, reason = state, f"cooldown active, maintaining {state}"
 
     diag = {
@@ -896,13 +896,10 @@ def trade_logic():
         last_run["status"] = "ok"
         return
 
-    # BAR COOLDOWN: skip if TWAP already started on this bar
+    # BAR COOLDOWN: only log, don't skip - let TWAP continue toward its target
     if twap.get("active") and twap.get("start_bar_ts") == str(bar_ts):
-        logger.info(f"[COOLDOWN] Skipping execution - TWAP already active on this bar (started {twap.get('start_bar_ts')})")
-        send_message(f"{msg_prefix}\nTWAP in progress (started this bar), waiting for next bar.\n{trig_line}")
-        last_run["time"] = time.time()
-        last_run["status"] = "ok"
-        return
+        logger.info(f"[COOLDOWN] TWAP active on this bar, continuing toward {twap.get('target')}")
+        # Don't return - fall through to continue TWAP execution
 
     # Start/refresh TWAP
     if not twap["active"] or twap["target"] != target:
