@@ -115,7 +115,7 @@ MAX_SLICE_USD        = float(os.getenv('MAX_SLICE_USD', '5000'))  # hard cap not
 SLICE_TIME_BUDGET    = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
 
 # Correct default: 6 hours
-GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(1 * 59 * 60)))
+GLOBAL_TWAP_TIME = float(os.getenv('GLOBAL_TWAP_TIME', str(6 * 60 * 60)))  # 6 hours
 
 # Hysteresis parameters
 HYSTERESIS_PCT = float(os.getenv('HYSTERESIS_PCT', '0.01'))  # 1% buffer by default
