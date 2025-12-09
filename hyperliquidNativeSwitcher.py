@@ -896,10 +896,12 @@ def trade_logic():
         last_run["status"] = "ok"
         return
 
-    # BAR COOLDOWN: only log, don't skip - let TWAP continue toward its target
+    # BAR COOLDOWN: If TWAP active on this bar, continue with existing target
     if twap.get("active") and twap.get("start_bar_ts") == str(bar_ts):
-        logger.info(f"[COOLDOWN] TWAP active on this bar, continuing toward {twap.get('target')}")
-        # Don't return - fall through to continue TWAP execution
+        if twap.get("target") != target:
+            logger.info(f"[COOLDOWN] Signal wants {target}, but continuing existing TWAP to {twap.get('target')} (same bar)")
+        target = twap["target"]  # Lock to existing TWAP target on same bar
+        # Fall through to continue TWAP execution
 
     # Start/refresh TWAP
     if not twap["active"] or twap["target"] != target:
