@@ -111,7 +111,7 @@ MAX_REBALANCE_STEPS  = int(os.getenv('MAX_REBALANCE_STEPS', '99'))
 SLEEP_SEC            = int(os.getenv('SLEEP_SEC', str(1 * 60 * 60)))
 TELEGRAM_SPAM_GUARD  = int(os.getenv('TELEGRAM_SPAM_GUARD', '1'))
 IMPACT_BPS_CAP       = int(os.getenv('IMPACT_BPS_CAP', '5'))     # ≤ 1 bp price impact per slice
-MAX_SLICE_USD        = float(os.getenv('MAX_SLICE_USD', '100000'))  # hard cap notional per slice
+MAX_SLICE_USD        = float(os.getenv('MAX_SLICE_USD', '1000000'))  # hard cap notional per slice
 SLICE_TIME_BUDGET    = float(os.getenv('SLICE_TIME_BUDGET', '45'))  # seconds max per leg
 
 # Correct default: 6 hours
